@@ -1,0 +1,70 @@
+From: Minimal Debug Patch for hisi_zip kernel panic verification
+Subject: [MINIMAL DEBUG] Quick verification patch
+
+This is a minimal version for quick testing. Focus on:
+1. Clear SQE memory (potential fix)
+2. Safety check in callback (prevent crash)
+3. Key debug prints
+
+---
+diff --git a/drivers/crypto/hisilicon/qm.c b/drivers/crypto/hisilicon/qm.c
+--- a/drivers/crypto/hisilicon/qm.c
++++ b/drivers/crypto/hisilicon/qm.c
+@@ -2155,6 +2155,12 @@ static struct hisi_qp *qm_create_qp_nolock(struct hisi_qm *qm, u8 alg_type,
+
+ 	qp = &qm->qp_array[qp_id];
+ 	hisi_qm_unset_hw_reset(qp);
++
++	/* FIX: Clear SQE to eliminate residual tag data that causes crash */
++	memset(qp->sqe, 0, qm->sqe_size * qp->sq_depth);
++	pr_info("[DEBUG-FIX] QP%u: SQE cleared before use\n", qp_id);
++
+ 	memset(qp->cqe, 0, sizeof(struct qm_cqe) * qp->cq_depth);
+
+ 	qp->event_cb = NULL;
+@@ -1057,6 +1063,15 @@ static void qm_poll_req_cb(struct hisi_qp *qp)
+
+ 	while (QM_CQE_PHASE(cqe) == qp->qp_status.cqc_phase) {
+ 		dma_rmb();
++
++		/* DEBUG: Detect spurious interrupt with no pending requests */
++		if (atomic_read(&qp->qp_status.used) == 0) {
++			dev_err(&qm->pdev->dev,
++				"[DEBUG] QP%u: CQE received but used=0! Possible stale interrupt\n",
++				qp->qp_id);
++			break;  /* Skip to avoid crash */
++		}
++
+ 		qp->req_cb(qp, qp->sqe + qm->sqe_size *
+ 			   le16_to_cpu(cqe->sq_head));
+ 		qm_cq_head_update(qp);
+diff --git a/drivers/crypto/hisilicon/zip/zip_crypto.c b/drivers/crypto/hisilicon/zip/zip_crypto.c
+--- a/drivers/crypto/hisilicon/zip/zip_crypto.c
++++ b/drivers/crypto/hisilicon/zip/zip_crypto.c
+@@ -309,9 +309,26 @@ static void hisi_zip_acomp_cb(struct hisi_qp *qp, void *data)
+ {
+ 	struct hisi_zip_sqe *sqe = data;
+ 	struct hisi_zip_req *req = (struct hisi_zip_req *)GET_REQ_FROM_SQE(sqe);
+-	struct hisi_zip_qp_ctx *qp_ctx = req->qp_ctx;
++
++	/* SAFETY CHECK: Prevent crash from invalid req pointer */
++	if (!req || IS_ERR_VALUE((unsigned long)req) || !req->qp_ctx) {
++		dev_err(&qp->qm->pdev->dev,
++			"[DEBUG-CRASH-PREVENT] QP%u: Invalid req from SQE! "
++			"dw26=0x%x, dw27=0x%x, req=%p\n",
++			qp->qp_id, sqe->dw26, sqe->dw27, req);
++		return;  /* Prevent kernel panic */
++	}
++
++	struct hisi_zip_qp_ctx *qp_ctx = req->qp_ctx;
+ 	const struct hisi_zip_sqe_ops *ops = qp_ctx->ctx->ops;
+ 	struct hisi_zip_dfx *dfx = &qp_ctx->zip_dev->dfx;
++
++	/* DEBUG: Log normal processing */
++	dev_dbg(&qp->qm->pdev->dev,
++		"[DEBUG] QP%u: valid callback, req=%p (id=%u)\n",
++		qp->qp_id, req, req->req_id);
++
+ 	struct device *dev = &qp->qm->pdev->dev;
+ 	struct acomp_req *acomp_req = req->req;
+ 	int err = 0;
