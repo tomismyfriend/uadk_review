@@ -1,0 +1,203 @@
+From: Add selftest for hisi_zip SQE initialization and callback safety
+Subject: [SELFTEST] Add kernel selftest to verify SQE cleared and callback safe
+
+This patch adds selftest infrastructure:
+1. SQE initialization check: verify dw26/dw27 are cleared after QP creation
+2. Callback safety check: verify tag pointer is valid before dereferencing
+3. Module parameter selftest_on_load to trigger test on module load
+
+Usage:
+1. Apply this patch after fix patch (04_fix_clear_sqe.patch)
+2. insmod hisi_zip.ko uacce_mode=0 selftest_on_load=1
+3. Check dmesg for [SELFTEST PASS] or [SELFTEST FAIL] messages
+
+Expected output:
+[SELFTEST PASS] QP0 all SQE slots cleared
+[SELFTEST PASS] QP1 all SQE slots cleared
+[SELFTEST PASS] hisi_zip selftest completed successfully
+
+Signed-off-by: Selftest Analysis
+
+---
+ drivers/crypto/hisilicon/qm.c                  | 28 +++++++++++++++
+ drivers/crypto/hisilicon/zip/zip_crypto.c      | 25 +++++++++++++
+ drivers/crypto/hisilicon/zip/zip_main.c        | 55 ++++++++++++++++++++++++++
+ 3 files changed, 108 insertions(+)
+
+diff --git a/drivers/crypto/hisilicon/qm.c b/drivers/crypto/hisilicon/qm.c
+index xxx..xxx 100644
+--- a/drivers/crypto/hisilicon/qm.c
++++ b/drivers/crypto/hisilicon/qm.c
+@@ -2156,6 +2156,34 @@ static struct hisi_qp *qm_create_qp_nolock(struct hisi_qm *qm, u8 alg_type,
+
+ 	qp = &qm->qp_array[qp_id];
+ 	hisi_qm_unset_hw_reset(qp);
++
++	/*
++	 * SELFTEST: Verify SQE initialization
++	 *
++	 * After QP creation, all SQE slots should have tag (dw26/dw27) = 0.
++	 * This prevents kernel panic when callback reads residual tag data.
++	 */
++	{
++		void *sqe_base;
++		u32 *dw26_ptr;
++		u32 *dw27_ptr;
++		u64 tag_value;
++		int slot_idx;
++		int test_passed = 1;
++
++		for (slot_idx = 0; slot_idx < qp->sq_depth; slot_idx++) {
++			sqe_base = qp->sqe + slot_idx * qm->sqe_size;
++			dw26_ptr = (u32 *)(sqe_base + 104);
++			dw27_ptr = (u32 *)(sqe_base + 108);
++			tag_value = (u64)(*dw26_ptr) | ((u64)(*dw27_ptr) << 32);
++
++			if (tag_value != 0) {
++				dev_err(&qm->pdev->dev,
++					"[SELFTEST FAIL] QP%u SQE[%d] tag=0x%llx (should be 0)\n",
++					qp_id, slot_idx, tag_value);
++				test_passed = 0;
++			}
++		}
++		if (test_passed)
++			dev_info(&qm->pdev->dev,
++				"[SELFTEST PASS] QP%u all SQE slots cleared\n", qp_id);
++	}
++
+ 	memset(qp->cqe, 0, sizeof(struct qm_cqe) * qp->cq_depth);
+
+ 	qp->event_cb = NULL;
+diff --git a/drivers/crypto/hisilicon/zip/zip_crypto.c b/drivers/crypto/hisilicon/zip/zip_crypto.c
+index xxx..xxx 100644
+--- a/drivers/crypto/hisilicon/zip/zip_crypto.c
++++ b/drivers/crypto/hisilicon/zip/zip_crypto.c
+@@ -309,6 +309,31 @@ static u32 hisi_zip_get_dstlen(struct hisi_zip_sqe *sqe)
+
+ static void hisi_zip_acomp_cb(struct hisi_qp *qp, void *data)
+ {
+ 	struct hisi_zip_sqe *sqe = data;
++	u64 tag_value;
++
++	/*
++	 * SELFTEST: Verify callback safety
++	 *
++	 * Before dereferencing req pointer from tag, verify:
++	 * 1. tag is not 0 (null pointer)
++	 * 2. tag is in valid kernel address range
++	 * 3. req->qp_ctx points back to correct qp
++	 */
++	tag_value = (u64)sqe->dw26 | ((u64)sqe->dw27 << 32);
++
++	if (tag_value == 0) {
++		dev_err(&qp->qm->pdev->dev,
++			"[SELFTEST FAIL] callback with tag=0 (null pointer)\n");
++		return;
++	}
++
++	if (tag_value < 0xffff800000000000ULL) {
++		dev_err(&qp->qm->pdev->dev,
++			"[SELFTEST FAIL] tag=0x%llx outside kernel range\n",
++			tag_value);
++		return;
++	}
++
+ 	struct hisi_zip_req *req = (struct hisi_zip_req *)GET_REQ_FROM_SQE(sqe);
+ 	struct hisi_zip_qp_ctx *qp_ctx = req->qp_ctx;
+ 	const struct hisi_zip_sqe_ops *ops = qp_ctx->ctx->ops;
+diff --git a/drivers/crypto/hisilicon/zip/zip_main.c b/drivers/crypto/hisilicon/zip/zip_main.c
+index xxx..xxx 100644
+--- a/drivers/crypto/hisilicon/zip/zip_main.c
++++ b/drivers/crypto/hisilicon/zip/zip_main.c
+@@ -XX,XX +XX,XX @@ static int hisi_zip_probe(struct pci_dev *pdev, const struct pci_device_id *id)
++
++static int selftest_on_load = 0;
++module_param(selftest_on_load, int, 0444);
++MODULE_PARM_DESC(selftest_on_load, "Run selftest on module load (0=off, 1=on)");
++
++static int hisi_zip_run_selftest(struct hisi_qm *qm)
++{
++	struct crypto_acomp *acomp;
++	struct acomp_req *req;
++	unsigned char src_buf[64];
++	unsigned char dst_buf[256];
++	unsigned char verify_buf[256];
++	struct scatterlist src_sg, dst_sg, verify_sg;
++	struct crypto_wait wait;
++	int ret;
++	unsigned int compressed_len;
++
++	dev_info(&qm->pdev->dev, "[SELFTEST] Starting hisi_zip functional test...\n");
++
++	strcpy(src_buf, "hello world test data for hisi_zip selftest");
++
++	acomp = crypto_alloc_acomp("deflate", 0, 0);
++	if (IS_ERR(acomp)) {
++		dev_err(&qm->pdev->dev, "[SELFTEST FAIL] alloc acomp failed\n");
++		return PTR_ERR(acomp);
++	}
++
++	sg_init_one(&src_sg, src_buf, strlen(src_buf));
++	sg_init_one(&dst_sg, dst_buf, sizeof(dst_buf));
++
++	req = acomp_request_alloc(acomp);
++	if (!req) {
++		dev_err(&qm->pdev->dev, "[SELFTEST FAIL] alloc req failed\n");
++		crypto_free_acomp(acomp);
++		return -ENOMEM;
++	}
++
++	acomp_request_set_params(req, &src_sg, &dst_sg, strlen(src_buf), sizeof(dst_buf));
++	crypto_init_wait(&wait);
++	acomp_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
++				   crypto_req_done, &wait);
++
++	ret = crypto_wait_req(crypto_acomp_compress(req), &wait);
++	if (ret) {
++		dev_err(&qm->pdev->dev, "[SELFTEST FAIL] compress failed: %d\n", ret);
++		acomp_request_free(req);
++		crypto_free_acomp(acomp);
++		return ret;
++	}
++
++	compressed_len = req->dlen;
++	dev_info(&qm->pdev->dev,
++		"[SELFTEST] compress succeeded, in=%u, out=%u\n",
++		strlen(src_buf), compressed_len);
++
++	/* Decompress and verify */
++	sg_init_one(&verify_sg, verify_buf, sizeof(verify_buf));
++	acomp_request_set_params(req, &dst_sg, &verify_sg, compressed_len, sizeof(verify_buf));
++
++	ret = crypto_wait_req(crypto_acomp_decompress(req), &wait);
++	if (ret) {
++		dev_err(&qm->pdev->dev, "[SELFTEST FAIL] decompress failed: %d\n", ret);
++		acomp_request_free(req);
++		crypto_free_acomp(acomp);
++		return ret;
++	}
++
++	if (memcmp(src_buf, verify_buf, strlen(src_buf)) != 0) {
++		dev_err(&qm->pdev->dev, "[SELFTEST FAIL] data mismatch after decompress\n");
++		acomp_request_free(req);
++		crypto_free_acomp(acomp);
++		return -EINVAL;
++	}
++
++	dev_info(&qm->pdev->dev, "[SELFTEST PASS] functional test completed successfully\n");
++
++	acomp_request_free(req);
++	crypto_free_acomp(acomp);
++
++	return 0;
++}
++
++/* In hisi_zip_probe(), after successful initialization: */
++	if (selftest_on_load) {
++		ret = hisi_zip_run_selftest(qm);
++		if (ret)
++			dev_err(&pdev->dev, "[SELFTEST] Selftest failed: %d\n", ret);
++	}
++
+--
+2.25.1

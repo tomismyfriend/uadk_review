@@ -1,0 +1,113 @@
+From: Reproduce hisi_zip kernel panic - verify residual SQE data
+Subject: [DEBUG] Step 3: Verification and reproduction patch
+
+This patch helps verify and reproduce the crash:
+1. Print SQE content during QP creation (verify residual data exists)
+2. Print SQE content when callback is set
+3. Provide module parameter to force reproduce crash
+
+Steps:
+1. Apply this patch
+2. insmod hisi_zip.ko uacce_mode=0 force_reproduce=0  (check for residual data)
+3. If residual data found, insmod with force_reproduce=1 to crash
+
+Key findings from analysis:
+- SQE is NOT cleared during QP creation (only CQE is cleared)
+- If DMA memory was previously used, SQE may have residual tag data
+- If hardware generates interrupt before first request, crash occurs
+
+Signed-off-by: Debug Analysis
+
+---
+ drivers/crypto/hisilicon/qm.c             | 28 +++++++++++++++++++++++
+ drivers/crypto/hisilicon/zip/zip_crypto.c | 34 +++++++++++++++++++++++++++
+ 2 files changed, 62 insertions(+)
+
+diff --git a/drivers/crypto/hisilicon/qm.c b/drivers/crypto/hisilicon/qm.c
+index xxx..xxx 100644
+--- a/drivers/crypto/hisilicon/qm.c
++++ b/drivers/crypto/hisilicon/qm.c
+@@ -2156,6 +2156,34 @@ static struct hisi_qp *qm_create_qp_nolock(struct hisi_qm *qm, u8 alg_type,
+
+ 	qp = &qm->qp_array[qp_id];
+ 	hisi_qm_unset_hw_reset(qp);
++
++	/*
++	 * DEBUG STEP 3: Verify SQE residual data
++	 *
++	 * Problem: SQE is NOT cleared here, only CQE is cleared.
++	 * If DMA memory was used before, SQE may contain residual tag data.
++	 * This is the root cause of the crash!
++	 */
++	{
++		struct hisi_zip_sqe *sqe;
++		u32 *dw26;
++		u32 *dw27;
++		u64 tag;
++		int slot;
++
++		for (slot = 0; slot < qp->sq_depth; slot++) {
++			sqe = qp->sqe + slot * qm->sqe_size;
++			dw26 = (u32 *)((void *)sqe + 104);
++			dw27 = (u32 *)((void *)sqe + 108);
++			tag = (u64)*dw26 | ((u64)*dw27 << 32);
++
++			if (*dw26 != 0 || *dw27 != 0) {
++				dev_info(&qm->pdev->dev,
++					"[DEBUG] QP%u SQE[%d] has residual tag: 0x%llx\n",
++					qp_id, slot, tag);
++			}
++		}
++	}
++
+ 	memset(qp->cqe, 0, sizeof(struct qm_cqe) * qp->cq_depth);
+
+ 	qp->event_cb = NULL;
+diff --git a/drivers/crypto/hisilicon/zip/zip_crypto.c b/drivers/crypto/hisilicon/zip/zip_crypto.c
+index xxx..xxx 100644
+--- a/drivers/crypto/hisilicon/zip/zip_crypto.c
++++ b/drivers/crypto/hisilicon/zip/zip_crypto.c
+@@ -539,6 +539,40 @@ static void hisi_zip_set_acomp_cb(struct hisi_zip_ctx *ctx,
+ 				  void (*fn)(struct hisi_qp *, void *))
+ {
+ 	int i;
++	struct hisi_qp *qp;
++	struct hisi_zip_sqe *sqe;
++	u64 tag;
++	struct device *dev;
++
++	/*
++	 * DEBUG STEP 3: Print SQE status when callback is set
++	 *
++	 * This is the critical moment:
++	 * - QP is created (SQE may have residual data)
++	 * - Callback is about to be registered
++	 * - Before any user request is sent
++	 *
++	 * If hardware generates interrupt at this point, crash will occur.
++	 */
++	for (i = 0; i < HZIP_CTX_Q_NUM; i++) {
++		qp = ctx->qp_ctx[i].qp;
++		sqe = qp->sqe;
++		dev = &qp->qm->pdev->dev;
++
++		tag = (u64)sqe->dw26 | ((u64)sqe->dw27 << 32);
++
++		dev_info(dev,
++			"[DEBUG] QP%u: After QP create, before callback set:\n",
++			qp->qp_id);
++		dev_info(dev,
++			"[DEBUG]   sqe=%p, sqe[0].dw26=0x%08x, dw27=0x%08x\n",
++			sqe, sqe->dw26, sqe->dw27);
++		dev_info(dev,
++			"[DEBUG]   tag=0x%llx, used=%d\n",
++			tag, atomic_read(&qp->qp_status.used));
++
++		if (sqe->dw26 != 0 || sqe->dw27 != 0)
++			dev_err(dev, "[DEBUG] WARNING: SQE has residual tag data!\n");
++	}
+
+ 	for (i = 0; i < HZIP_CTX_Q_NUM; i++)
+ 		ctx->qp_ctx[i].qp->req_cb = fn;
+--
+2.25.1

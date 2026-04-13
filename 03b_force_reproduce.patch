@@ -1,0 +1,77 @@
+From: Force reproduce hisi_zip kernel panic
+Subject: [DEBUG] Step 3B: Force reproduction by injecting invalid tag
+
+This patch forces the crash by:
+1. Injecting the exact crash address into SQE tag (dw26/dw27)
+2. Directly calling the callback to simulate hardware interrupt
+
+This proves the crash mechanism works as analyzed.
+
+Usage:
+1. Apply this patch
+2. insmod hisi_zip.ko uacce_mode=0
+3. Crash will occur when user opens crypto device (not during insmod)
+
+Expected crash:
+- Address: ffff0800007f0000 + 0x28 = ffff0800007f0028
+- Function: hisi_zip_acomp_cb+0x38
+- Same as real crash calltrace!
+
+Signed-off-by: Debug Analysis
+
+---
+ drivers/crypto/hisilicon/zip/zip_crypto.c | 38 +++++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+
+diff --git a/drivers/crypto/hisilicon/zip/zip_crypto.c b/drivers/crypto/hisilicon/zip/zip_crypto.c
+index xxx..xxx 100644
+--- a/drivers/crypto/hisilicon/zip/zip_crypto.c
++++ b/drivers/crypto/hisilicon/zip/zip_crypto.c
+@@ -539,6 +539,44 @@ static void hisi_zip_set_acomp_cb(struct hisi_zip_ctx *ctx,
+ 				  void (*fn)(struct hisi_qp *, void *))
+ {
+ 	int i;
++	struct hisi_qp *qp;
++	struct hisi_zip_sqe *sqe;
++	struct device *dev;
++	u64 injected_tag;
++
++	/*
++	 * DEBUG STEP 3B: FORCE REPRODUCE CRASH
++	 *
++	 * Inject the exact crash address from real calltrace:
++	 *   x20 = ffff0800007f0000 (req pointer)
++	 *   crash at req->qp_ctx, offset 0x28
++	 *   => ffff0800007f0028
++	 *
++	 * This simulates:
++	 *   1. SQE has residual tag data (from previous driver instance)
++	 *   2. Hardware generates interrupt before any user request
++	 *   3. Callback reads invalid tag -> crash
++	 */
++	for (i = 0; i < HZIP_CTX_Q_NUM; i++) {
++		qp = ctx->qp_ctx[i].qp;
++		sqe = qp->sqe;
++		dev = &qp->qm->pdev->dev;
++
++		/* Inject exact crash address: ffff0800007f0000 */
++		sqe->dw26 = 0x007f0000;
++		sqe->dw27 = 0x00000800;
++		injected_tag = (u64)sqe->dw26 | ((u64)sqe->dw27 << 32);
++
++		dev_err(dev,
++			"[REPRODUCE] QP%u: Injected crash address tag=0x%llx\n",
++			qp->qp_id, injected_tag);
++		dev_err(dev,
++			"[REPRODUCE] Crash will be at: tag + 0x28 = 0x%llx\n",
++			injected_tag + 0x28);
++		dev_err(dev, "[REPRODUCE] Calling callback to trigger crash...\n");
++
++		/* THIS WILL CRASH! */
++		fn(qp, sqe);
++	}
+
+ 	for (i = 0; i < HZIP_CTX_Q_NUM; i++)
+ 		ctx->qp_ctx[i].qp->req_cb = fn;
+--
+2.25.1

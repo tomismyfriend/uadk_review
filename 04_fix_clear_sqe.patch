@@ -1,0 +1,39 @@
+From: Fix hisi_zip kernel panic by clearing SQE during QP creation
+Subject: [FIX] Clear SQE memory to prevent residual tag data crash
+
+Root cause:
+- SQE memory is NOT cleared during QP creation
+- Only CQE is cleared in qm_create_qp_nolock
+- If DMA memory was used before, SQE may contain residual tag data
+- If hardware generates interrupt before first request, callback reads
+  invalid tag pointer -> kernel panic
+
+Fix:
+- Clear SQE memory when QP is created
+- This ensures no residual tag data exists before callback is registered
+
+Test:
+- Apply this patch
+- Run rmmod/insmod cycle multiple times
+- No crash should occur
+
+Signed-off-by: Fix Analysis
+
+---
+ drivers/crypto/hisilicon/qm.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/crypto/hisilicon/qm.c b/drivers/crypto/hisilicon/qm.c
+index xxx..xxx 100644
+--- a/drivers/crypto/hisilicon/qm.c
++++ b/drivers/crypto/hisilicon/qm.c
+@@ -2158,6 +2158,7 @@ static struct hisi_qp *qm_create_qp_nolock(struct hisi_qm *qm, u8 alg_type,
+
+ 	qp = &qm->qp_array[qp_id];
+ 	hisi_qm_unset_hw_reset(qp);
++	memset(qp->sqe, 0, qm->sqe_size * qp->sq_depth);
+ 	memset(qp->cqe, 0, sizeof(struct qm_cqe) * qp->cq_depth);
+
+ 	qp->event_cb = NULL;
+--
+2.25.1
